@@ -11,6 +11,7 @@
 
 double maxeps = 0.1e-7;
 unsigned itmax = 100;
+unsigned it;
 double eps, sum;
 const int N = 64;
 int d_N, wrank, wsize;
@@ -18,8 +19,13 @@ double *A;
 double *B;
 int block_start, block, block_end;
 
-unsigned NUM_BACKUP_PROC = 0; // from total count
+int NUM_BACKUP_PROC = 1; // from total count
+const unsigned CONTROL_POINT = 5;
+const unsigned IT_FOR_KILL = 16;
+const unsigned NUMBER_PROC = 1;
+
 int flag_fault = 0;
+int flag_kill = 0;
 
 MPI_Comm my_comm = MPI_COMM_WORLD;
 
@@ -49,7 +55,7 @@ int main(int argc, char **argv) {
     if (block_end != N) {
         block_end += 1;
     }
-    if (wrank > wsize) {
+    if (wrank >= wsize) {
         block_start = 3;
         block_end = 3;
     }
@@ -61,24 +67,29 @@ int main(int argc, char **argv) {
     MPI_Barrier(my_comm);
     double start = MPI_Wtime();
     init();
-    for (unsigned it = 0; it <= itmax; it++) {
-        const unsigned CONTROL_POINT = 5;
+    for (it = 0; it <= itmax; it++) {
         if (flag_fault) {
-            it -= it % CONTROL_POINT;
+            restore_data();
             flag_fault = 0;
         }
         if (it % CONTROL_POINT == 0) {
             save_data();
         }
 
-        const unsigned IT_FOR_KILL = 16000;
-        const unsigned NUMBER_PROC = wsize - 4;
-        if (it == IT_FOR_KILL && wrank == NUMBER_PROC) {
-//            raise(SIGKILL);
-        }
 
         eps = 0.;
+        MPI_Barrier(my_comm);
+
+        if (flag_fault) {
+            continue;
+        }
+
         relax_resid(A, B);
+
+        if (flag_fault) {
+            continue;
+        }
+
         double *t = A;
         A = B;
         B = t;
@@ -87,8 +98,13 @@ int main(int argc, char **argv) {
         }
         if (eps < maxeps)
             break;
-        update_data();
         MPI_Barrier(my_comm);
+
+        if (flag_fault) {
+            continue;
+        }
+
+        update_data();
     }
     verify();
     MPI_Barrier(my_comm);
@@ -133,10 +149,10 @@ inline void relax_resid(double *A, double *B) {
 inline void verify() {
     double s = 0.0;
     if (wrank == 0) {
-  //      block_start -= 1;
+        block_start -= 1;
     }
     if (wrank == wsize - 1) {
-//        block_end += 1;
+        block_end += 1;
     }
 #pragma omp parallel for shared(A, N, d_N) reduction(+:s)
     for (unsigned i = block_start + 1; i < block_end - 1; i++)
@@ -146,10 +162,10 @@ inline void verify() {
             }
     MPI_Allreduce(&s, &sum, 1, MPI_DOUBLE, MPI_SUM, my_comm);
     if (wrank == 0) {
-    //    block_start += 1;
+        block_start += 1;
     }
     if (wrank == wsize - 1) {
-    //    block_end -= 1;
+        block_end -= 1;
     }
 }
 
@@ -165,6 +181,12 @@ inline void update_data() {
     if (wrank) {
         MPI_Isend(A + (block_start + 1) * d_N, d_N, MPI_DOUBLE, wrank - 1, 1216, my_comm, &request[1]);
     } 
+    // kill proc here
+    // #########################################
+    if (!flag_kill && it == IT_FOR_KILL && wrank == NUMBER_PROC) {
+        raise(SIGKILL);
+    }
+    // ##########################################
     if (wrank != wsize - 1) {
         MPI_Isend(A + (block_end - 2) * d_N, d_N, MPI_DOUBLE, wrank + 1, 1215, my_comm, &request[2]);
     } 
@@ -187,30 +209,44 @@ void save_data() {
     if (block_start == block_end) {
         return;
     }
-    char name[10];
-    sprintf(name, "data_%d", wrank);
-    FILE* f = fopen(name, "wb");
-    fwrite(A, sizeof(double), N * d_N, f);
-    fclose(f);
+    char nameA[10];
+    char nameB[10];
+    sprintf(nameA, "dataA_%d", wrank);
+    sprintf(nameB, "dataB_%d", wrank);
+    FILE* fA = fopen(nameA, "wb");
+    FILE* fB = fopen(nameB, "wb");
+    fwrite(A, sizeof(double), N * d_N, fA);
+    fwrite(B, sizeof(double), N * d_N, fB);
+    fclose(fA);
+    fclose(fB);
 }
 
 void restore_data() {
     if (block_start == block_end) {
         return;
     }
-    char name[10];
-    sprintf(name, "data_%d", wrank);
-    FILE* f = fopen(name, "rb");
-    fread(A, sizeof(double), N * d_N, f);
-    fclose(f);
+    char nameA[10];
+    char nameB[10];
+    sprintf(nameA, "dataA_%d", wrank);
+    sprintf(nameB, "dataB_%d", wrank);
+    FILE* fA = fopen(nameA, "rb");
+    FILE* fB = fopen(nameB, "rb");
+    fread(A, sizeof(double), N * d_N, fA);
+    fread(B, sizeof(double), N * d_N, fB);
+    fclose(fA);
+    fclose(fB);
 }
 
 static void verbose_errhandler(MPI_Comm* comm, int* err, ...) {
+    int rank, size;
     int eclass;
     MPI_Error_class(*err, &eclass);
     if (MPIX_ERR_PROC_FAILED != eclass) {
         MPI_Abort(*comm, *err);
     }
+
+    MPI_Comm_rank(my_comm, &rank);
+    MPI_Comm_size(my_comm, &size);
 
     MPI_Group group_c, group_f;
     int nf;
@@ -221,7 +257,7 @@ static void verbose_errhandler(MPI_Comm* comm, int* err, ...) {
     char errstr[MPI_MAX_ERROR_STRING];
     int len;
     MPI_Error_string(*err, errstr, &len);
-    printf("Rank %d / %d:  Notified of error %s. %d found dead: ( ", wrank, wsize, errstr, nf);
+    printf("Rank %d / %d:  Notified of error %s. %d found dead: ( ", rank, size, errstr, nf);
 
     int* ranks_gf = malloc(nf * sizeof(int));
     int* ranks_gc = malloc(nf * sizeof(int));
@@ -263,6 +299,8 @@ static void verbose_errhandler(MPI_Comm* comm, int* err, ...) {
         block_start = 3;
         block_end = 3;
     }
+    printf("Rank %d -> %d %d %d \n", rank, wrank, block_start, block_end);
+    fflush(stdout);
     
     restore_data();
 
@@ -270,4 +308,6 @@ static void verbose_errhandler(MPI_Comm* comm, int* err, ...) {
     free(ranks_gf);
 
     flag_fault = 1;
+    flag_kill = 1;
+    it -= it % CONTROL_POINT + 1;
 }
