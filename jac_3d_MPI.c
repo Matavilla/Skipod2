@@ -19,7 +19,7 @@ double *A;
 double *B;
 int block_start, block, block_end;
 
-int NUM_BACKUP_PROC = 1; // from total count
+unsigned NUM_CREATE_PROC = 1;
 const unsigned CONTROL_POINT = 5;
 const unsigned IT_FOR_KILL = 16;
 const unsigned NUMBER_PROC = 1;
@@ -41,10 +41,20 @@ static void verbose_errhandler(MPI_Comm* comm, int* err, ...);
 int main(int argc, char **argv) {
     MPI_Init(&argc, &argv);
     
+    MPI_Comm pcomm, icomm;
+    MPI_Comm_get_parent(&pcomm);
+    if (pcomm == MPI_COMM_NULL) {
+        MPI_Comm_spawn("./a.out", MPI_ARGV_NULL, NUM_CREATE_PROC, MPI_INFO_NULL, 0, my_comm, &icomm, MPI_ERRCODES_IGNORE);
+    } else {
+        icomm = pcomm;
+    }
+
+    MPI_Intercomm_merge(icomm, (pcomm == MPI_COMM_NULL ? 0 : 1), &my_comm);
+    
     MPI_Comm_rank(my_comm, &wrank);
     MPI_Comm_size(my_comm, &wsize);
-    wsize -= NUM_BACKUP_PROC;
-
+    wsize -= NUM_CREATE_PROC;
+    
     d_N = N * N;
     block = N / wsize;
     block_start = block * wrank;
@@ -276,16 +286,18 @@ static void verbose_errhandler(MPI_Comm* comm, int* err, ...) {
 
     printf(")\n");
 
-    if (nf > NUM_BACKUP_PROC) {
+    if (nf > NUM_CREATE_PROC) {
         MPI_Abort(*comm, *err);
     }
-    NUM_BACKUP_PROC -= nf;
+
+    NUM_CREATE_PROC -= nf;
 
     MPIX_Comm_shrink(*comm, &my_comm);
     MPI_Comm_rank(my_comm, &wrank);
     MPI_Comm_size(my_comm, &wsize);
     
-    wsize -= NUM_BACKUP_PROC;
+    wsize -= NUM_CREATE_PROC;
+    
     block = N / wsize;
     block_start = block * wrank;
     block_end = block + block_start;
